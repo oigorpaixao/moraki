@@ -72,10 +72,10 @@ export default function Home() {
           </div>
 
           <h1 style={{ fontSize: 44, lineHeight: 1.1, margin: "14px 0 10px" }}>
-            Antes de comprar um imóvel, entenda o lugar.
+           Antes de comprar um imóvel, entenda o que ninguém te conta sobre o lugar.
           </h1>
           <p style={{ margin: 0, fontSize: 16, color: "#9ca3af", maxWidth: 760 }}>
-            Analisamos preço vs mercado, segurança, infraestrutura e notícias recentes do entorno — para você decidir com mais confiança.
+            Analisamos dados públicos, infraestrutura, segurança e contexto urbano para apoiar sua decisão — não substitui avaliação técnica.
           </p>
         </header>
 
@@ -116,6 +116,7 @@ export default function Home() {
 
           <div style={{ marginTop: 10, color: "#94a3b8", fontSize: 12 }}>
             Não indicamos imóveis. Não vendemos anúncios.
+            Quanto mais específico o endereço, melhor a análise.
           </div>
 
           {error && (
