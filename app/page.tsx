@@ -81,22 +81,25 @@ export default function Home() {
 
         <section style={{ background: "#0f172a", border: "1px solid #1f2937", borderRadius: 16, padding: 18 }}>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Cole o endereço ou link do anúncio"
-              <div className="mt-6 rounded-2xl border border-white/10 bg-white/5 p-5">
+           <input
+  value={query}
+  onChange={(e) => setQuery(e.target.value)}
+  placeholder="Cole o endereço ou link do anúncio"
+  />
+
+{/* BLOCO 2 */}
+<div className="mt-6 rounded-2xl border border-white/10 bg-white/5 p-5">
   <h2 className="text-lg font-semibold text-white">
     O que você recebe nessa análise
   </h2>
 
   <ul className="mt-3 space-y-2 text-sm text-white/80">
-    <li><span className="font-medium text-white/90">• Nota geral (0–100)</span> com leitura rápida do potencial do local</li>
-    <li><span className="font-medium text-white/90">• Preço vs mercado</span> (sinal de oportunidade ou risco)</li>
-    <li><span className="font-medium text-white/90">• Segurança &amp; risco</span> (alertas e pontos de atenção)</li>
-    <li><span className="font-medium text-white/90">• Infraestrutura &amp; mobilidade</span> (acesso, serviços e deslocamento)</li>
-    <li><span className="font-medium text-white/90">• Radar do entorno</span> (contexto urbano e sinais recentes)</li>
-    <li><span className="font-medium text-white/90">• Resumo final</span> com <span className="font-medium text-white/90">prós</span> e <span className="font-medium text-white/90">cuidados</span> antes de decidir</li>
+    <li><span className="font-medium text-white/90">Nota geral (0–100)</span> com leitura rápida do potencial do local</li>
+    <li><span className="font-medium text-white/90">Preço vs mercado</span> (sinal de oportunidade ou risco)</li>
+    <li><span className="font-medium text-white/90">Segurança &amp; risco</span> (alertas e pontos de atenção)</li>
+    <li><span className="font-medium text-white/90">Infraestrutura &amp; mobilidade</span> (acesso, serviços e deslocamento)</li>
+    <li><span className="font-medium text-white/90">Radar do entorno</span> (contexto urbano e sinais recentes)</li>
+    <li><span className="font-medium text-white/90">Resumo final</span> com <span className="font-medium text-white/90">prós</span> e <span className="font-medium text-white/90">cuidados</span> antes de decidir</li>
   </ul>
 
   <p className="mt-4 text-xs text-white/60">
