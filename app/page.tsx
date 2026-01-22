@@ -72,7 +72,7 @@ export default function Home() {
           </div>
 
           <h1 style={{ fontSize: 44, lineHeight: 1.1, margin: "14px 0 10px" }}>
-           Antes de comprar um imóvel, entenda o que ninguém te conta sobre o lugar.
+           Antes de comprar um imóvel, entenda o que ninguém te conta sobre o lugar
           </h1>
           <p style={{ margin: 0, fontSize: 16, color: "#9ca3af", maxWidth: 760 }}>
             Analisamos dados públicos, infraestrutura, segurança e contexto urbano para apoiar sua decisão — não substitui avaliação técnica.
