@@ -247,15 +247,15 @@ function Grid3({ positives, cautions, risks }: { positives: string[]; cautions: 
   return (
     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
       <div style={{ border: "1px solid #334155", borderRadius: 14, padding: 12, background: "#0b1220" }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>✔ Pontos fortes</div>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>✅ O que joga a favor</div>
         {positives.length ? <SmallList items={positives} /> : <div style={{ color: "#9ca3af" }}>—</div>}
       </div>
       <div style={{ border: "1px solid #334155", borderRadius: 14, padding: 12, background: "#0b1220" }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>⚠ Pontos de atenção</div>
+      <div style={{ fontWeight: 700, marginBottom: 8 }}>⚠️ Onde ter cautela</div>
         {cautions.length ? <SmallList items={cautions} /> : <div style={{ color: "#9ca3af" }}>—</div>}
       </div>
       <div style={{ border: "1px solid #334155", borderRadius: 14, padding: 12, background: "#0b1220" }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>❌ Riscos</div>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>❌ Pontos críticos</div>
         {risks.length ? <SmallList items={risks} /> : <div style={{ color: "#9ca3af" }}>—</div>}
       </div>
     </div>
