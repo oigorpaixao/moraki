@@ -1,16 +1,14 @@
 import os
 import json
 import hashlib
-import re
 from datetime import datetime, timezone
-from typing import Literal, Optional, Dict, Any, List
+from typing import Literal, Optional, Dict, Any, List, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# OpenAI official SDK (Responses API recommended for new projects)
 from openai import OpenAI
 
 APP_CITY_DEFAULT = "São Paulo"
@@ -52,8 +50,8 @@ app.add_middleware(
 )
 
 # --- Simple in-memory cache (MVP) ---
-# In production, move to Redis or Postgres table.
 _cache: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "21600"))  # 6h default
 
 def _cache_key(city: str, query: str) -> str:
   raw = f"{city.strip().lower()}|{query.strip().lower()}"
@@ -62,17 +60,15 @@ def _cache_key(city: str, query: str) -> str:
 def _now_iso() -> str:
   return datetime.now(timezone.utc).isoformat()
 
+def _now_ts() -> int:
+  return int(datetime.now(timezone.utc).timestamp())
+
 # --- News retrieval (MVP) ---
-# For the MVP we support 2 modes:
-# 1) If BING_NEWS_KEY is set, fetch via Bing News Search endpoint.
-# 2) Otherwise, return an empty list and let the LLM create a conservative 'no items found' output.
 async def fetch_news(city: str, query: str) -> List[Dict[str, str]]:
   key = os.getenv("BING_NEWS_KEY")
   if not key:
     return []
 
-  # Bing News Search API (endpoint can vary by Azure configuration).
-  # We'll use the public endpoint format; if you use Azure, you may need to adjust.
   endpoint = os.getenv("BING_NEWS_ENDPOINT","https://api.bing.microsoft.com/v7.0/news/search")
   q = f"{query} {city}"
   params = {"q": q, "mkt": "pt-BR", "count": 5, "sortBy": "Date"}
@@ -81,7 +77,6 @@ async def fetch_news(city: str, query: str) -> List[Dict[str, str]]:
   async with httpx.AsyncClient(timeout=12) as client:
     r = await client.get(endpoint, params=params, headers=headers)
     if r.status_code != 200:
-      # Don't fail the whole analysis due to news API. Just return empty.
       return []
     data = r.json()
     items = []
@@ -94,108 +89,181 @@ async def fetch_news(city: str, query: str) -> List[Dict[str, str]]:
       })
     return items
 
-# --- Scoring (MVP heuristic - pseudo-dinâmico e determinístico) ---
-def _clamp(n: int, lo: int, hi: int) -> int:
-  return max(lo, min(hi, n))
+# ----------------------------
+# Scoring (Upgrade: place_score + confidence)
+# ----------------------------
 
-def _norm(s: str) -> str:
-  return (s or "").strip().lower()
+POSITIVE_KWS = {
+  "inaugura", "inauguração", "invest", "investimento", "revitaliza", "revitalização",
+  "obra", "melhoria", "reforma", "expansão", "novo", "abertura", "parque", "hospital",
+  "metrô", "linha", "mobilidade", "segurança reforçada", "queda de crimes", "redução de crimes"
+}
 
-def label_from_total(total: int) -> str:
-  if total >= 80:
-    return "Boa decisão"
-  if total >= 65:
-    return "Boa decisão, com atenção"
-  if total >= 45:
-    return "Atenção"
-  return "Não recomendado"
+NEGATIVE_KWS = {
+  "assalto", "roubo", "furto", "homicídio", "latrocínio", "tiroteio", "crime", "violência",
+  "sequestro", "arrastão", "tráfico", "explosão", "incêndio", "acidente", "interdição",
+  "protesto", "greve", "alagamento", "enchente", "deslizamento"
+}
 
-def compute_breakdown_mvp(query: str, city: str) -> Dict[str, int]:
+MONITOR_KWS = {
+  "investiga", "investigação", "suspeita", "alerta", "risco", "denúncia", "aumento de casos",
+  "surto", "dengue", "chikungunya", "zika", "intermitência", "instabilidade"
+}
+
+def _clamp(n: float, lo: int, hi: int) -> int:
+  return int(max(lo, min(hi, round(n))))
+
+def _address_specificity(query: str) -> float:
   """
-  Heurística MVP:
-  - Mantém uma base fixa (seu breakdown original)
-  - Ajusta levemente de forma determinística por:
-    * nível de detalhe do endereço (número, vírgula, tamanho)
-    * palavras-chave simples (metro, avenida, parque etc.)
-    * cidade (um toque leve)
-    * salt determinístico (hash) para variar entre endereços diferentes
+  Retorna 0..1 com base em sinais de especificidade do endereço.
+  Serve para CONFIANÇA, não para qualidade do lugar.
   """
-  q = _norm(query)
-  c = _norm(city)
+  q = query.lower().strip()
+  score = 0.0
 
-  # Base (o que você já tinha)
-  breakdown: Dict[str, int] = {
-    "Preço vs Mercado": 18,
-    "Segurança & Risco": 15,
-    "Infraestrutura & Mobilidade": 16,
-    "Radar do Entorno": 12,
-    "Estabilidade da Região": 8
+  if any(ch.isdigit() for ch in q):
+    score += 0.35
+  if "," in q or "-" in q:
+    score += 0.15
+
+  import re
+  if re.search(r"\b\d{5}-\d{3}\b", q) or re.search(r"\b\d{8}\b", q):
+    score += 0.25
+
+  if "http://" in q or "https://" in q:
+    score += 0.25
+
+  if any(t in q for t in ["bairro", "rua", "avenida", "av.", "travessa", "alameda", "praça"]):
+    score += 0.10
+
+  return max(0.0, min(1.0, score))
+
+def _title_signal(title: str) -> Tuple[int, int, int]:
+  t = (title or "").lower()
+  pos = any(k in t for k in POSITIVE_KWS)
+  neg = any(k in t for k in NEGATIVE_KWS)
+  mon = any(k in t for k in MONITOR_KWS)
+
+  # conservador: neg > monitor > pos
+  if neg:
+    return (0, 0, 1)
+  if mon:
+    return (0, 1, 0)
+  if pos:
+    return (1, 0, 0)
+  return (0, 0, 0)
+
+def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str, Any]:
+  """
+  Retorna:
+  - place_score (0..100): qualidade do lugar (sinais, notícias)
+  - confidence (0..100): confiança na análise (especificidade + evidência)
+  - total (0..100): score final ponderado (place ajustado por confidence)
+  - breakdown: por blocos (continua existindo pro front)
+  """
+
+  specificity = _address_specificity(query)
+
+  pos_n = mon_n = neg_n = 0
+  for n in (news or []):
+    p, m, g = _title_signal(n.get("title", ""))
+    pos_n += p
+    mon_n += m
+    neg_n += g
+
+  news_count = len(news or [])
+
+  # --------------------
+  # 1) PLACE SCORE (não usa specificity)
+  # --------------------
+  # Base neutra (não “bonita”): 70 distribuído
+  base_place = {
+    "Preço vs Mercado": 14,
+    "Segurança & Risco": 14,
+    "Infraestrutura & Mobilidade": 14,
+    "Radar do Entorno": 14,
+    "Estabilidade da Região": 14,
   }
 
-  # 1) Qualidade do input (mais completo = melhor leitura)
-  has_number = bool(re.search(r"\d+", q))
-  has_separator = ("," in q) or ("-" in q)
-  long_enough = len(q) >= 18
-
-  if has_number:
-    breakdown["Preço vs Mercado"] += 1
+  # Evidência (notícias) afeta Radar e um pouco estabilidade
+  if news_count == 0:
+    base_place["Radar do Entorno"] -= 4   # sem evidência, fica mais neutro/baixo
+    base_place["Estabilidade da Região"] -= 1
   else:
-    breakdown["Preço vs Mercado"] -= 1
+    base_place["Radar do Entorno"] += _clamp(min(4, news_count), 1, 4)
 
-  if has_separator:
-    breakdown["Infraestrutura & Mobilidade"] += 1
+  # Sinais negativos/monitor impactam segurança/estabilidade (qualidade do lugar)
+  base_place["Segurança & Risco"] -= _clamp(6 * neg_n + 2 * mon_n, 0, 18)
+  base_place["Estabilidade da Região"] -= _clamp(4 * neg_n + 2 * mon_n, 0, 14)
 
-  if long_enough:
-    breakdown["Radar do Entorno"] += 1
+  # Sinais positivos podem ajudar infra/radar (teto baixo)
+  base_place["Infraestrutura & Mobilidade"] += _clamp(2 * pos_n, 0, 6)
+  base_place["Radar do Entorno"] += _clamp(1 * pos_n, 0, 3)
+
+  breakdown = {
+    "Preço vs Mercado": _clamp(base_place["Preço vs Mercado"], 0, 25),
+    "Segurança & Risco": _clamp(base_place["Segurança & Risco"], 0, 25),
+    "Infraestrutura & Mobilidade": _clamp(base_place["Infraestrutura & Mobilidade"], 0, 20),
+    "Radar do Entorno": _clamp(base_place["Radar do Entorno"], 0, 15),
+    "Estabilidade da Região": _clamp(base_place["Estabilidade da Região"], 0, 15),
+  }
+
+  place_score = sum(breakdown.values())  # 0..100
+
+  # --------------------
+  # 2) CONFIDENCE (usa specificity + evidência)
+  # --------------------
+  # Começa conservador
+  confidence = 35
+
+  # mais específico => mais confiança (até +35)
+  confidence += _clamp(35 * specificity, 0, 35)
+
+  # mais notícias => mais evidência (até +20)
+  confidence += _clamp(5 * news_count, 0, 20)
+
+  # se existem sinais (pos/neg/monitor) nas manchetes, aumenta um pouco a confiança
+  signal_strength = pos_n + mon_n + neg_n
+  confidence += _clamp(4 * signal_strength, 0, 12)
+
+  confidence = _clamp(confidence, 0, 100)
+
+  # --------------------
+  # 3) FINAL SCORE (pondera lugar pela confiança)
+  # --------------------
+  # Quando confidence=0 => multiplicador 0.60
+  # Quando confidence=100 => multiplicador 1.00
+  multiplier = 0.60 + 0.40 * (confidence / 100.0)
+  total = _clamp(place_score * multiplier, 0, 100)
+
+  # label em cima do FINAL (não do place)
+  if total >= 80:
+    label = "Boa decisão"
+  elif total >= 65:
+    label = "Boa decisão, com atenção"
+  elif total >= 50:
+    label = "Neutro (precisa de mais dados)"
   else:
-    breakdown["Radar do Entorno"] -= 1
+    label = "Não recomendado"
 
-  # 2) Palavras-chave simples (não “inventam” dados, só mudam a heurística)
-  # Mobilidade
-  if any(k in q for k in ["metro", "metrô", "estação", "estacao", "terminal", "corredor", "avenida", "av "]):
-    breakdown["Infraestrutura & Mobilidade"] += 2
+  meta = {
+    "place_score": place_score,
+    "confidence": confidence,
+    "multiplier": round(multiplier, 2),
+    "specificity": round(specificity, 2),
+    "news_count": news_count,
+    "signals": {"positive": pos_n, "monitor": mon_n, "negative": neg_n},
+  }
 
-  # Equipamentos / serviços
-  if any(k in q for k in ["shopping", "parque", "praça", "praca", "hospital", "escola", "faculdade", "universidade"]):
-    breakdown["Infraestrutura & Mobilidade"] += 1
-    breakdown["Radar do Entorno"] += 1
-
-  # Sinais de preocupação/risco (bem conservador)
-  if any(k in q for k in ["favela", "comunidade", "perig", "assalto", "tiroteio"]):
-    breakdown["Segurança & Risco"] -= 4
-    breakdown["Radar do Entorno"] += 2
-    breakdown["Estabilidade da Região"] -= 1
-
-  # 3) Ajuste leve por cidade
-  if c in ["são paulo", "sao paulo", "sp"]:
-    breakdown["Infraestrutura & Mobilidade"] += 1
-    breakdown["Radar do Entorno"] += 1
-  elif c in ["rio de janeiro", "rj"]:
-    breakdown["Radar do Entorno"] += 1
-  elif c:
-    breakdown["Estabilidade da Região"] += 1
-
-  # 4) Salt determinístico (sem aleatoriedade): -3..+3
-  seed = f"{q}|{c}"
-  h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-  salt = (int(h[:2], 16) % 7) - 3
-
-  # Espalha um pouco o salt
-  breakdown["Preço vs Mercado"] += salt
-  breakdown["Segurança & Risco"] -= (salt // 2)
-  breakdown["Radar do Entorno"] += (salt // 2)
-
-  # Clamp final por bloco (0–20)
-  for k in breakdown:
-    breakdown[k] = _clamp(int(breakdown[k]), 0, 20)
-
-  return breakdown
-
-def compute_score_mvp(query: str, city: str) -> Dict[str, Any]:
-  breakdown = compute_breakdown_mvp(query, city)
-  total = _clamp(sum(breakdown.values()), 0, 100)
-  label = label_from_total(total)
-  return {"total": total, "label": label, "breakdown": breakdown}
+  return {
+    "total": total,
+    "label": label,
+    "breakdown": breakdown,
+    # novos campos (upgrade)
+    "place_score": place_score,
+    "confidence": confidence,
+    "meta": meta
+  }
 
 # --- OpenAI call (Responses API) ---
 def get_openai_client() -> OpenAI:
@@ -205,30 +273,31 @@ def get_openai_client() -> OpenAI:
   return OpenAI(api_key=api_key)
 
 def build_prompt(city: str, query: str, news: List[Dict[str, str]], score: Dict[str, Any]) -> str:
-  # Keep prompt deterministic, safe, and explicit about unknowns.
-  news_text = "\n".join([f"- {n.get('title','')} ({n.get('datePublished','')}) — fonte: {n.get('source','')} — url: {n.get('url','')}" for n in news]) or "(nenhuma notícia retornada pela API)"
+  news_text = "\n".join([
+    f"- {n.get('title','')} ({n.get('datePublished','')}) — fonte: {n.get('source','')} — url: {n.get('url','')}"
+    for n in news
+  ]) or "(nenhuma notícia retornada pela API)"
+
   return f"""Você é um consultor neutro de decisão imobiliária. Gere um relatório objetivo em PT-BR.
 NÃO invente dados. Se não houver dados suficientes, seja transparente e conservador.
 
 Cidade piloto: {city}
 Consulta do usuário: {query}
 
-Pontuação preliminar (heurística do MVP):
-- Total: {score['total']} / 100
+Pontuação (MVP):
+- Score final (ponderado): {score['total']} / 100
+- Score do lugar (place_score): {score.get('place_score')} / 100
+- Confiança do diagnóstico (confidence): {score.get('confidence')} / 100
 - Quebra por bloco: {json.dumps(score['breakdown'], ensure_ascii=False)}
+- Metadados: {json.dumps(score.get('meta',{}), ensure_ascii=False)}
 
 Notícias/eventos do entorno (últimos meses):
 {news_text}
 
 Tarefa:
-1) Produza um resumo em 1 frase (summary) que explique a conclusão com equilíbrio.
+1) Produza um resumo em 1 frase (summary) que explique a conclusão com equilíbrio e mencione o nível de confiança (alto/médio/baixo) sem inventar.
 2) Liste 3–5 pontos fortes (positives), 2–4 pontos de atenção (cautions) e 0–3 riscos (risks).
 3) Produza até 5 itens de radar (radar). Cada item deve ser baseado nas notícias fornecidas; se não houver notícias, retorne radar vazio [].
-   - impact: "positive" | "monitor" | "risk"
-   - title: título curto
-   - date: data (se disponível)
-   - why_it_matters: 1–2 frases objetivas
-   - source: nome da fonte (se disponível)
 
 Responda SOMENTE no formato JSON válido, com estas chaves exatas:
 {{
@@ -241,12 +310,10 @@ Responda SOMENTE no formato JSON válido, com estas chaves exatas:
 """.strip()
 
 def safe_json_parse(text: str) -> Dict[str, Any]:
-  # Try direct parse; if fails, attempt to extract first JSON object.
   try:
     return json.loads(text)
   except Exception:
-    m = None
-    # Find first {...} block
+    import re
     m = re.search(r"\{[\s\S]*\}", text)
     if m:
       return json.loads(m.group(0))
@@ -261,18 +328,21 @@ async def analyze(req: AnalyzeRequest):
   city = req.city.strip() or APP_CITY_DEFAULT
   query = req.query.strip()
 
-  # cache
   key = _cache_key(city, query)
-  if key in _cache:
-    return _cache[key]
 
-  # ✅ Agora o score varia (determinístico) conforme query/city
-  score = compute_score_mvp(query, city)
+  # cache com TTL
+  cached = _cache.get(key)
+  if cached:
+    if (_now_ts() - int(cached.get("_cached_at", 0))) <= CACHE_TTL_SECONDS:
+      return cached["payload"]
+    else:
+      _cache.pop(key, None)
 
   news = await fetch_news(city, query)
+  score = compute_score(city, query, news)
 
   client = get_openai_client()
-  model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # adjustable
+  model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
   prompt = build_prompt(city, query, news, score)
 
@@ -282,13 +352,12 @@ async def analyze(req: AnalyzeRequest):
       input=prompt,
       temperature=0.2,
     )
-    # Extract text output (Responses API)
+
     out_text = ""
     for item in resp.output:
       if item.type == "output_text":
         out_text += item.text
     if not out_text:
-      # Some SDK versions return output_text via resp.output_text
       out_text = getattr(resp, "output_text", "") or ""
 
     parsed = safe_json_parse(out_text)
@@ -297,12 +366,10 @@ async def analyze(req: AnalyzeRequest):
   except Exception as e:
     raise HTTPException(status_code=500, detail=f"Falha ao gerar relatório (IA): {str(e)}")
 
-  # normalize and validate
+  # normalize and validate radar
   try:
     radar_items = parsed.get("radar", []) or []
-    radar = []
-    for it in radar_items[:5]:
-      radar.append(RadarItem(**it))
+    radar = [RadarItem(**it) for it in radar_items[:5]]
   except Exception:
     radar = []
 
@@ -318,5 +385,5 @@ async def analyze(req: AnalyzeRequest):
     generated_at=_now_iso()
   ).model_dump()
 
-  _cache[key] = result
+  _cache[key] = {"_cached_at": _now_ts(), "payload": result}
   return result
