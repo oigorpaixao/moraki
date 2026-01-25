@@ -1,6 +1,7 @@
 import os
 import json
 import hashlib
+import re
 from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List
 
@@ -93,18 +94,107 @@ async def fetch_news(city: str, query: str) -> List[Dict[str, str]]:
       })
     return items
 
-# --- Scoring (MVP heuristic) ---
-def compute_score_stub() -> Dict[str, Any]:
-  # MVP placeholder: we return a neutral baseline that the LLM can explain.
-  breakdown = {
+# --- Scoring (MVP heuristic - pseudo-dinâmico e determinístico) ---
+def _clamp(n: int, lo: int, hi: int) -> int:
+  return max(lo, min(hi, n))
+
+def _norm(s: str) -> str:
+  return (s or "").strip().lower()
+
+def label_from_total(total: int) -> str:
+  if total >= 80:
+    return "Boa decisão"
+  if total >= 65:
+    return "Boa decisão, com atenção"
+  if total >= 45:
+    return "Atenção"
+  return "Não recomendado"
+
+def compute_breakdown_mvp(query: str, city: str) -> Dict[str, int]:
+  """
+  Heurística MVP:
+  - Mantém uma base fixa (seu breakdown original)
+  - Ajusta levemente de forma determinística por:
+    * nível de detalhe do endereço (número, vírgula, tamanho)
+    * palavras-chave simples (metro, avenida, parque etc.)
+    * cidade (um toque leve)
+    * salt determinístico (hash) para variar entre endereços diferentes
+  """
+  q = _norm(query)
+  c = _norm(city)
+
+  # Base (o que você já tinha)
+  breakdown: Dict[str, int] = {
     "Preço vs Mercado": 18,
     "Segurança & Risco": 15,
     "Infraestrutura & Mobilidade": 16,
     "Radar do Entorno": 12,
     "Estabilidade da Região": 8
   }
-  total = sum(breakdown.values())
-  label = "Boa decisão, com atenção" if total >= 55 else "Não recomendado"
+
+  # 1) Qualidade do input (mais completo = melhor leitura)
+  has_number = bool(re.search(r"\d+", q))
+  has_separator = ("," in q) or ("-" in q)
+  long_enough = len(q) >= 18
+
+  if has_number:
+    breakdown["Preço vs Mercado"] += 1
+  else:
+    breakdown["Preço vs Mercado"] -= 1
+
+  if has_separator:
+    breakdown["Infraestrutura & Mobilidade"] += 1
+
+  if long_enough:
+    breakdown["Radar do Entorno"] += 1
+  else:
+    breakdown["Radar do Entorno"] -= 1
+
+  # 2) Palavras-chave simples (não “inventam” dados, só mudam a heurística)
+  # Mobilidade
+  if any(k in q for k in ["metro", "metrô", "estação", "estacao", "terminal", "corredor", "avenida", "av "]):
+    breakdown["Infraestrutura & Mobilidade"] += 2
+
+  # Equipamentos / serviços
+  if any(k in q for k in ["shopping", "parque", "praça", "praca", "hospital", "escola", "faculdade", "universidade"]):
+    breakdown["Infraestrutura & Mobilidade"] += 1
+    breakdown["Radar do Entorno"] += 1
+
+  # Sinais de preocupação/risco (bem conservador)
+  if any(k in q for k in ["favela", "comunidade", "perig", "assalto", "tiroteio"]):
+    breakdown["Segurança & Risco"] -= 4
+    breakdown["Radar do Entorno"] += 2
+    breakdown["Estabilidade da Região"] -= 1
+
+  # 3) Ajuste leve por cidade
+  if c in ["são paulo", "sao paulo", "sp"]:
+    breakdown["Infraestrutura & Mobilidade"] += 1
+    breakdown["Radar do Entorno"] += 1
+  elif c in ["rio de janeiro", "rj"]:
+    breakdown["Radar do Entorno"] += 1
+  elif c:
+    breakdown["Estabilidade da Região"] += 1
+
+  # 4) Salt determinístico (sem aleatoriedade): -3..+3
+  seed = f"{q}|{c}"
+  h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+  salt = (int(h[:2], 16) % 7) - 3
+
+  # Espalha um pouco o salt
+  breakdown["Preço vs Mercado"] += salt
+  breakdown["Segurança & Risco"] -= (salt // 2)
+  breakdown["Radar do Entorno"] += (salt // 2)
+
+  # Clamp final por bloco (0–20)
+  for k in breakdown:
+    breakdown[k] = _clamp(int(breakdown[k]), 0, 20)
+
+  return breakdown
+
+def compute_score_mvp(query: str, city: str) -> Dict[str, Any]:
+  breakdown = compute_breakdown_mvp(query, city)
+  total = _clamp(sum(breakdown.values()), 0, 100)
+  label = label_from_total(total)
   return {"total": total, "label": label, "breakdown": breakdown}
 
 # --- OpenAI call (Responses API) ---
@@ -157,7 +247,6 @@ def safe_json_parse(text: str) -> Dict[str, Any]:
   except Exception:
     m = None
     # Find first {...} block
-    import re
     m = re.search(r"\{[\s\S]*\}", text)
     if m:
       return json.loads(m.group(0))
@@ -177,7 +266,9 @@ async def analyze(req: AnalyzeRequest):
   if key in _cache:
     return _cache[key]
 
-  score = compute_score_stub()
+  # ✅ Agora o score varia (determinístico) conforme query/city
+  score = compute_score_mvp(query, city)
+
   news = await fetch_news(city, query)
 
   client = get_openai_client()
