@@ -42,25 +42,29 @@ app = FastAPI(title="Decision Engine MVP", version="0.1.0")
 # -------------------------
 # ✅ CORS (FIX para Vercel)
 # -------------------------
-# Use CORS_ORIGINS com lista separada por vírgula.
-# Exemplo no Render:
-# CORS_ORIGINS=https://moraki-7n33.vercel.app,https://*.vercel.app,http://localhost:3000
+# Por que isso resolve:
+# - O browser faz um preflight OPTIONS antes do POST /v1/analyze
+# - Se o backend não responder com Access-Control-Allow-Origin, o fetch dá "Failed to fetch"
+#
+# Configure no Render (Environment):
+#   CORS_ORIGINS=https://moraki-7n33.vercel.app,http://localhost:3000
+#   CORS_ORIGIN_REGEX=^https://.*\.vercel\.app$
+#
+# Obs: CORSMiddleware NÃO aceita "*.vercel.app" em allow_origins,
+# por isso usamos allow_origin_regex para liberar qualquer preview da Vercel.
+
 raw_origins = os.getenv("CORS_ORIGINS", "").strip()
+origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else []
 
-if raw_origins:
-  origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
-else:
-  # Se você não configurar, liberamos geral (sem credenciais)
-  origins = ["*"]
+origin_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or r"^https://.*\.vercel\.app$"
 
-# Como o front faz fetch sem cookies/sessão, deixe False.
-# (Importante: wildcard "*" + credenciais = problema no browser)
-allow_credentials = False
-
+# Importante: se você não usa cookies/sessão no fetch, deixe False.
+# (allow_credentials=True + "*" costuma virar dor de cabeça no CORS)
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=origins,
-  allow_credentials=allow_credentials,
+  allow_origins=origins,                 # ex: ["https://moraki-7n33.vercel.app","http://localhost:3000"]
+  allow_origin_regex=origin_regex,       # libera previews da Vercel
+  allow_credentials=False,
   allow_methods=["GET", "POST", "OPTIONS"],
   allow_headers=["*"],
 )
