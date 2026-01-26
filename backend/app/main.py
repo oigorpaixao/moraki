@@ -39,34 +39,29 @@ class AnalyzeResponse(BaseModel):
 # --- App ---
 app = FastAPI(title="Decision Engine MVP", version="0.1.0")
 
-# ----------------------------
-# CORS (fix para Vercel)
-# ----------------------------
-# IMPORTANTE:
-# - NÃO use "*" quando allow_credentials=True (o browser bloqueia)
-# - Use uma lista explícita de origins
-DEFAULT_ALLOWED_ORIGINS = [
-  "https://moraki-7n33.vercel.app",
-  # se você tiver domínio custom, adiciona aqui:
-  # "https://seudominio.com",
-]
-
+# -------------------------
+# ✅ CORS (FIX para Vercel)
+# -------------------------
+# Use CORS_ORIGINS com lista separada por vírgula.
+# Exemplo no Render:
+# CORS_ORIGINS=https://moraki-7n33.vercel.app,https://*.vercel.app,http://localhost:3000
 raw_origins = os.getenv("CORS_ORIGINS", "").strip()
 
 if raw_origins:
-  # Ex: CORS_ORIGINS="https://a.com,https://b.com"
   origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
-  # Se alguém setar "*" por engano, ignora e usa a lista segura
-  if "*" in origins:
-    origins = DEFAULT_ALLOWED_ORIGINS
 else:
-  origins = DEFAULT_ALLOWED_ORIGINS
+  # Se você não configurar, liberamos geral (sem credenciais)
+  origins = ["*"]
+
+# Como o front faz fetch sem cookies/sessão, deixe False.
+# (Importante: wildcard "*" + credenciais = problema no browser)
+allow_credentials = False
 
 app.add_middleware(
   CORSMiddleware,
   allow_origins=origins,
-  allow_credentials=True,
-  allow_methods=["*"],
+  allow_credentials=allow_credentials,
+  allow_methods=["GET", "POST", "OPTIONS"],
   allow_headers=["*"],
 )
 
@@ -197,7 +192,6 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
   # --------------------
   # 1) PLACE SCORE (não usa specificity)
   # --------------------
-  # Base neutra (não “bonita”): 70 distribuído
   base_place = {
     "Preço vs Mercado": 14,
     "Segurança & Risco": 14,
@@ -206,18 +200,15 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
     "Estabilidade da Região": 14,
   }
 
-  # Evidência (notícias) afeta Radar e um pouco estabilidade
   if news_count == 0:
-    base_place["Radar do Entorno"] -= 4   # sem evidência, fica mais neutro/baixo
+    base_place["Radar do Entorno"] -= 4
     base_place["Estabilidade da Região"] -= 1
   else:
     base_place["Radar do Entorno"] += _clamp(min(4, news_count), 1, 4)
 
-  # Sinais negativos/monitor impactam segurança/estabilidade (qualidade do lugar)
   base_place["Segurança & Risco"] -= _clamp(6 * neg_n + 2 * mon_n, 0, 18)
   base_place["Estabilidade da Região"] -= _clamp(4 * neg_n + 2 * mon_n, 0, 14)
 
-  # Sinais positivos podem ajudar infra/radar (teto baixo)
   base_place["Infraestrutura & Mobilidade"] += _clamp(2 * pos_n, 0, 6)
   base_place["Radar do Entorno"] += _clamp(1 * pos_n, 0, 3)
 
@@ -229,35 +220,26 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
     "Estabilidade da Região": _clamp(base_place["Estabilidade da Região"], 0, 15),
   }
 
-  place_score = sum(breakdown.values())  # 0..100
+  place_score = sum(breakdown.values())
 
   # --------------------
-  # 2) CONFIDENCE (usa specificity + evidência)
+  # 2) CONFIDENCE
   # --------------------
-  # Começa conservador
   confidence = 35
-
-  # mais específico => mais confiança (até +35)
   confidence += _clamp(35 * specificity, 0, 35)
-
-  # mais notícias => mais evidência (até +20)
   confidence += _clamp(5 * news_count, 0, 20)
 
-  # se existem sinais (pos/neg/monitor) nas manchetes, aumenta um pouco a confiança
   signal_strength = pos_n + mon_n + neg_n
   confidence += _clamp(4 * signal_strength, 0, 12)
 
   confidence = _clamp(confidence, 0, 100)
 
   # --------------------
-  # 3) FINAL SCORE (pondera lugar pela confiança)
+  # 3) FINAL SCORE
   # --------------------
-  # Quando confidence=0 => multiplicador 0.60
-  # Quando confidence=100 => multiplicador 1.00
   multiplier = 0.60 + 0.40 * (confidence / 100.0)
   total = _clamp(place_score * multiplier, 0, 100)
 
-  # label em cima do FINAL (não do place)
   if total >= 80:
     label = "Boa decisão"
   elif total >= 65:
@@ -280,7 +262,6 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
     "total": total,
     "label": label,
     "breakdown": breakdown,
-    # novos campos (upgrade)
     "place_score": place_score,
     "confidence": confidence,
     "meta": meta
@@ -351,7 +332,6 @@ async def analyze(req: AnalyzeRequest):
 
   key = _cache_key(city, query)
 
-  # cache com TTL
   cached = _cache.get(key)
   if cached:
     if (_now_ts() - int(cached.get("_cached_at", 0))) <= CACHE_TTL_SECONDS:
@@ -387,7 +367,6 @@ async def analyze(req: AnalyzeRequest):
   except Exception as e:
     raise HTTPException(status_code=500, detail=f"Falha ao gerar relatório (IA): {str(e)}")
 
-  # normalize and validate radar
   try:
     radar_items = parsed.get("radar", []) or []
     radar = [RadarItem(**it) for it in radar_items[:5]]
