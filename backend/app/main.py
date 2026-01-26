@@ -39,14 +39,35 @@ class AnalyzeResponse(BaseModel):
 # --- App ---
 app = FastAPI(title="Decision Engine MVP", version="0.1.0")
 
-# CORS for Vercel frontend
-allowed = os.getenv("CORS_ORIGINS","*").split(",")
+# ----------------------------
+# CORS (fix para Vercel)
+# ----------------------------
+# IMPORTANTE:
+# - NÃO use "*" quando allow_credentials=True (o browser bloqueia)
+# - Use uma lista explícita de origins
+DEFAULT_ALLOWED_ORIGINS = [
+  "https://moraki-7n33.vercel.app",
+  # se você tiver domínio custom, adiciona aqui:
+  # "https://seudominio.com",
+]
+
+raw_origins = os.getenv("CORS_ORIGINS", "").strip()
+
+if raw_origins:
+  # Ex: CORS_ORIGINS="https://a.com,https://b.com"
+  origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+  # Se alguém setar "*" por engano, ignora e usa a lista segura
+  if "*" in origins:
+    origins = DEFAULT_ALLOWED_ORIGINS
+else:
+  origins = DEFAULT_ALLOWED_ORIGINS
+
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in allowed] if allowed else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+  CORSMiddleware,
+  allow_origins=origins,
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
 )
 
 # --- Simple in-memory cache (MVP) ---
