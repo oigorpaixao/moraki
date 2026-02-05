@@ -5,13 +5,18 @@ from datetime import datetime, timezone
 from typing import Literal, Optional, Dict, Any, List, Tuple
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from openai import OpenAI
 
 APP_CITY_DEFAULT = "São Paulo"
+DEBUG = os.getenv("DEBUG", "0").strip() in ("1", "true", "True", "yes", "YES")
+
+def _log(msg: str) -> None:
+  if DEBUG:
+    print(msg)
 
 # --- Models ---
 class AnalyzeRequest(BaseModel):
@@ -40,26 +45,14 @@ class AnalyzeResponse(BaseModel):
 app = FastAPI(title="Decision Engine MVP", version="0.1.0")
 
 # -------------------------
-# ✅ CORS (FIX para Vercel)
+# ✅ CORS
 # -------------------------
-# Por que isso resolve:
-# - O browser faz um preflight OPTIONS antes do POST /v1/analyze
-# - Se o backend não responder com Access-Control-Allow-Origin, o fetch dá "Failed to fetch"
-#
-# Configure no Render (Environment):
-#   CORS_ORIGINS=https://moraki-7n33.vercel.app,http://localhost:3000
-#   CORS_ORIGIN_REGEX=^https://.*\.vercel\.app$
-#
-# Obs: CORSMiddleware NÃO aceita "*.vercel.app" em allow_origins,
-# por isso usamos allow_origin_regex para liberar qualquer preview da Vercel.
-
 raw_origins = os.getenv("CORS_ORIGINS", "").strip()
 origins = [o.strip() for o in raw_origins.split(",") if o.strip()] if raw_origins else []
 
+# Ex: ^https://.*\.vercel\.app$  (previews)  + você pode incluir seu domínio custom aqui também se quiser
 origin_regex = os.getenv("CORS_ORIGIN_REGEX", "").strip() or r"^https://.*\.vercel\.app$"
 
-# Importante: se você não usa cookies/sessão no fetch, deixe False.
-# (allow_credentials=True + "*" costuma virar dor de cabeça no CORS)
 app.add_middleware(
   CORSMiddleware,
   allow_origins=origins,                 # ex: ["https://moraki-7n33.vercel.app","http://localhost:3000"]
@@ -85,34 +78,64 @@ def _now_ts() -> int:
 
 # --- News retrieval (MVP) ---
 async def fetch_news(city: str, query: str) -> List[Dict[str, str]]:
-  key = os.getenv("BING_NEWS_KEY")
+  key = os.getenv("BING_NEWS_KEY", "").strip()
   if not key:
+    _log("[bing] BING_NEWS_KEY vazio -> news=[]")
     return []
 
-  endpoint = os.getenv("BING_NEWS_ENDPOINT","https://api.bing.microsoft.com/v7.0/news/search")
+  endpoint = os.getenv("BING_NEWS_ENDPOINT", "https://api.bing.microsoft.com/v7.0/news/search").strip()
   q = f"{query} {city}"
-  params = {"q": q, "mkt": "pt-BR", "count": 5, "sortBy": "Date"}
-  headers = {"Ocp-Apim-Subscription-Key": key}
 
-  async with httpx.AsyncClient(timeout=12) as client:
-    r = await client.get(endpoint, params=params, headers=headers)
+  # Melhores chances de vir algo + “recência”
+  params = {
+    "q": q,
+    "mkt": "pt-BR",
+    "count": 10,
+    "sortBy": "Date",
+    "freshness": "Month",     # Day | Week | Month
+    "textFormat": "Raw",
+    "safeSearch": "Moderate",
+  }
+
+  headers = {
+    "Ocp-Apim-Subscription-Key": key,
+    "User-Agent": "moraki-mvp/0.1",
+  }
+
+  try:
+    async with httpx.AsyncClient(timeout=15) as client:
+      r = await client.get(endpoint, params=params, headers=headers)
+
     if r.status_code != 200:
+      # Loga só um pedaço do corpo pra não poluir
+      body_preview = (r.text or "")[:400].replace("\n", " ")
+      _log(f"[bing] status={r.status_code} body_preview={body_preview}")
       return []
+
     data = r.json()
-    items = []
-    for it in data.get("value", [])[:5]:
+    values = data.get("value", []) or []
+    _log(f"[bing] ok count={len(values)} q='{q}'")
+
+    items: List[Dict[str, str]] = []
+    for it in values[:5]:
+      provider = it.get("provider") or []
+      source_name = (provider[0].get("name", "") if provider and isinstance(provider, list) else "")
       items.append({
-        "title": it.get("name","").strip(),
-        "url": it.get("url","").strip(),
-        "datePublished": it.get("datePublished","").strip(),
-        "source": (it.get("provider",[{}])[0].get("name","") if it.get("provider") else "")
+        "title": (it.get("name", "") or "").strip(),
+        "url": (it.get("url", "") or "").strip(),
+        "datePublished": (it.get("datePublished", "") or "").strip(),
+        "source": (source_name or "").strip(),
       })
+
     return items
 
-# ----------------------------
-# Scoring (Upgrade: place_score + confidence)
-# ----------------------------
+  except Exception as e:
+    _log(f"[bing] exception={type(e).__name__} msg={str(e)}")
+    return []
 
+# ----------------------------
+# Scoring (place_score + confidence)
+# ----------------------------
 POSITIVE_KWS = {
   "inaugura", "inauguração", "invest", "investimento", "revitaliza", "revitalização",
   "obra", "melhoria", "reforma", "expansão", "novo", "abertura", "parque", "hospital",
@@ -134,10 +157,6 @@ def _clamp(n: float, lo: int, hi: int) -> int:
   return int(max(lo, min(hi, round(n))))
 
 def _address_specificity(query: str) -> float:
-  """
-  Retorna 0..1 com base em sinais de especificidade do endereço.
-  Serve para CONFIANÇA, não para qualidade do lugar.
-  """
   q = query.lower().strip()
   score = 0.0
 
@@ -164,7 +183,6 @@ def _title_signal(title: str) -> Tuple[int, int, int]:
   neg = any(k in t for k in NEGATIVE_KWS)
   mon = any(k in t for k in MONITOR_KWS)
 
-  # conservador: neg > monitor > pos
   if neg:
     return (0, 0, 1)
   if mon:
@@ -174,14 +192,6 @@ def _title_signal(title: str) -> Tuple[int, int, int]:
   return (0, 0, 0)
 
 def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str, Any]:
-  """
-  Retorna:
-  - place_score (0..100): qualidade do lugar (sinais, notícias)
-  - confidence (0..100): confiança na análise (especificidade + evidência)
-  - total (0..100): score final ponderado (place ajustado por confidence)
-  - breakdown: por blocos (continua existindo pro front)
-  """
-
   specificity = _address_specificity(query)
 
   pos_n = mon_n = neg_n = 0
@@ -193,9 +203,6 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
 
   news_count = len(news or [])
 
-  # --------------------
-  # 1) PLACE SCORE (não usa specificity)
-  # --------------------
   base_place = {
     "Preço vs Mercado": 14,
     "Segurança & Risco": 14,
@@ -226,9 +233,6 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
 
   place_score = sum(breakdown.values())
 
-  # --------------------
-  # 2) CONFIDENCE
-  # --------------------
   confidence = 35
   confidence += _clamp(35 * specificity, 0, 35)
   confidence += _clamp(5 * news_count, 0, 20)
@@ -238,9 +242,6 @@ def compute_score(city: str, query: str, news: List[Dict[str, str]]) -> Dict[str
 
   confidence = _clamp(confidence, 0, 100)
 
-  # --------------------
-  # 3) FINAL SCORE
-  # --------------------
   multiplier = 0.60 + 0.40 * (confidence / 100.0)
   total = _clamp(place_score * multiplier, 0, 100)
 
@@ -329,6 +330,11 @@ def safe_json_parse(text: str) -> Dict[str, Any]:
 def health():
   return {"ok": True, "time": _now_iso()}
 
+# reduz o 404 no console do browser (favicon)
+@app.get("/favicon.ico")
+def favicon():
+  return Response(status_code=204)
+
 @app.post("/v1/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
   city = req.city.strip() or APP_CITY_DEFAULT
@@ -359,13 +365,14 @@ async def analyze(req: AnalyzeRequest):
     )
 
     out_text = ""
-    for item in resp.output:
-      if item.type == "output_text":
-        out_text += item.text
+    for item in getattr(resp, "output", []) or []:
+      if getattr(item, "type", None) == "output_text":
+        out_text += getattr(item, "text", "") or ""
     if not out_text:
       out_text = getattr(resp, "output_text", "") or ""
 
     parsed = safe_json_parse(out_text)
+
   except HTTPException:
     raise
   except Exception as e:
